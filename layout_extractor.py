@@ -13,13 +13,23 @@ if not hasattr(ImageFont.FreeTypeFont, 'getsize'):
 
 import layoutparser as lp
 
+# Monkey-patch effdet.create_model to always pass pretrained=False
+import effdet
+_original_create_model = effdet.create_model
+
+def create_model_no_pretrained(*args, **kwargs):
+    kwargs['pretrained'] = False
+    return _original_create_model(*args, **kwargs)
+
+effdet.create_model = create_model_no_pretrained
+
 # ----------------------------
 # Load EfficientDet Layout Model
 # ----------------------------
 
 model = lp.models.effdet.layoutmodel.EfficientDetLayoutModel(
     "tf_efficientdet_d0",   # model architecture name
-    model_path="publaynet-tf_efficientdet_d0.pth.tar",
+    model_path="publaynet-tf_efficientdet_d0.pth",
     label_map={1: "Text", 2: "Title", 3: "List", 4: "Table", 5: "Figure"},
     device="cpu",  # or "cuda" if you have a GPU
     extra_config={"output_confidence_threshold": 0.1}

@@ -1,0 +1,1 @@
+Downloading: "https://github.com/rwightman/efficientdet-pytorch/releases/download/v0.1/tf_efficientdet_d0_34-f153e0cf.pth" to C:\Users\lenovo/.cache\torch\hub\checkpoints\tf_efficientdet_d0_34-f153e0cf.pth
