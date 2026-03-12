@@ -2,6 +2,7 @@ import os
 import sys
 import glob
 import cv2
+import argparse
 import fitz  # PyMuPDF
 import numpy as np
 import pytesseract
@@ -30,7 +31,77 @@ LANG_MAP = {
     'ko': 'kor', 'ar': 'ara'
 }
 
+VIS_COLORS = {
+    'title': (0, 0, 255),               # Red (BGR)
+    'plain text': (0, 255, 0),          # Green
+    'abandon': (128, 128, 128),         # Gray
+    'figure': (255, 0, 0),              # Blue
+    'figure caption': (255, 100, 100),  # Light Blue
+    'table': (0, 165, 255),             # Orange
+    'table caption': (0, 200, 255),     # Light Orange
+    'isolate formula': (255, 0, 255),   # Magenta
+    'formula caption': (255, 100, 255)  # Light Magenta
+}
+
 import re
+
+PUNCT_SPACE = re.compile(r'\s+([.,»!?;])')
+PUNCT_SPACE2 = re.compile(r'([«])\s+')
+PUNCT_PARAS = re.compile(r'[•}^$■]')
+PUNCT_POINT = re.compile(r'\.{4,}')
+PUNCT_DASH = re.compile(r'(-—)|(—-)')
+PUNCT_DASH2 = re.compile(r'([^ ])—')
+PUNCT_DASH3 = re.compile(r'—([^ ])')
+
+def clean_extracted_text(text):
+    """
+    Cleans up punctuation and unnecessary line breaks natively returned by PDF parsers.
+    It merges hyphenated word wraps seamlessly and combines paragraph lines with spaces.
+    """
+    if not text: return ""
+    
+    lines = text.split('\n')
+    processed_lines = []
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+            
+        if len(line) < 3:
+            processed_lines.append(line)
+            i += 1
+            continue
+            
+        # Detect end-of-line hyphens for word continuation
+        merge_next = False
+        if line.endswith('\xad') or line.endswith('-'):
+            line = line[:-1] # strip the hyphen
+            merge_next = True
+            
+        # Clean up punctuation spacing
+        line = PUNCT_SPACE.sub(r'\1', line)
+        line = PUNCT_SPACE2.sub(r'\1', line)
+        line = PUNCT_PARAS.sub('', line)
+        line = PUNCT_POINT.sub('...', line)
+        line = PUNCT_DASH.sub('—', line)
+        line = PUNCT_DASH2.sub(r'\1 —', line)
+        line = PUNCT_DASH3.sub(r'— \1', line)
+        
+        if merge_next and i + 1 < len(lines):
+            # Prep the next line to receive the prefix without any space
+            lines[i+1] = line + lines[i+1].strip()
+        else:
+            processed_lines.append(line)
+            
+        i += 1
+        
+    # Join with a single space to construct unbroken markdown paragraphs
+    result = " ".join(processed_lines)
+    result = re.sub(r'\s+', ' ', result)
+    return result.strip()
 
 # ... Keep existing imports ...
 
@@ -49,6 +120,51 @@ def get_center(xyxy):
 def get_distance(p1, p2):
     # Calculate Euclidean distance between two points
     return np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+
+def calculate_iou(box1, box2):
+    """Calculate the Intersection over Union (IoU) of two bounding boxes."""
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    
+    union = area1 + area2 - intersection
+    if union == 0:
+        return 0
+    return intersection / union
+
+def filter_duplicate_elements(elements, iou_threshold=0.8):
+    """
+    Remove heavily overlapping elements of the EXACT SAME type (like 2 layered titles).
+    Elements is list: [ [[x1,y1,x2,y2], name], ... ]
+    """
+    if not elements: return []
+    
+    filtered_elements = []
+    # Simple NMS-style filtering: assume list is somewhat raw.
+    # The IoU threshold of 0.8 means if 80% of a box overlaps an identical-class box, drop one.
+    skip_indices = set()
+    
+    for i in range(len(elements)):
+        if i in skip_indices: continue
+        filtered_elements.append(elements[i])
+        
+        for j in range(i + 1, len(elements)):
+            if j in skip_indices: continue
+            
+            # If they are exactly the same class assignment...
+            if elements[i][1] == elements[j][1]:
+                iou = calculate_iou(elements[i][0], elements[j][0])
+                if iou > iou_threshold:
+                    # They are essentially stamping over each other wildly. Discard the duplicate.
+                    skip_indices.add(j)
+                    
+    return filtered_elements
 
 def detect_ocr_language(sample_text):
     if not sample_text or len(sample_text.strip()) < 10:
@@ -90,6 +206,7 @@ def sort_elements_multicolumn(elements, page_width):
     
     placed_indices = set(wide_elements_idx)
     sorted_output = []
+    column_separators = []
     
     band_queue_idx = 0
     wide_queue_idx = 0
@@ -132,6 +249,12 @@ def sort_elements_multicolumn(elements, page_width):
                 for col_idx in col_order:
                     sorted_output.extend(col_groups[col_idx])
                     
+                # Collect actual column separator bounds to visualize them!
+                if n_cols == 2:
+                    centers = sorted(kmeans.cluster_centers_.flatten())
+                    mid_x = (centers[0] + centers[1]) / 2
+                    column_separators.append((mid_x, b_top, b_bottom))
+                    
             except Exception as e:
                 print(f"  [WARN] KMeans failed on this band ({e}). Defaulting to standard Y sort.")
                 band_elements.sort(key=lambda x: (x[0][1] // 20, x[0][0]))
@@ -152,10 +275,10 @@ def sort_elements_multicolumn(elements, page_width):
         stragglers.sort(key=lambda x: (x[0][1] // 20, x[0][0]))
         sorted_output.extend(stragglers)
         
-    return sorted_output
+    return sorted_output, bands, column_separators
 
 # ... Inside process_pdf_to_markdown ...
-def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model):
+def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model, args):
     print(f"\n==================================================")
     print(f"Starting Document: {input_path}")
     print(f"  > Target Markdown: {output_md_path}")
@@ -185,6 +308,7 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model)
         print(f"[INFO] Loaded static image.")
 
     detected_lang = None # Will figure this out on the first chunk of text
+    annotated_pages = [] # Will store visual debugging representations
 
     for i in range(total_pages):
         
@@ -210,6 +334,7 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model)
         # doclayout_yolo expects image in RGB format
         page_img_rgb = cv2.cvtColor(page_img, cv2.COLOR_BGR2RGB)
         pil_img_rgb = Image.fromarray(page_img_rgb)
+        vis_img = page_img.copy() # Clone image for visualization
         
         # YOLO layout prediction
         
@@ -235,7 +360,14 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model)
                 cat_name = names[cls_id]
                 elements.append([xyxy, cat_name]) # Convert from tuple to list exactly so we can append matched captions inside later
                 
-            print(f"[LAYOUT] Detected {len(elements)} structural elements on Page {i+1}:")
+            # Filter Overlapping/Duplicate Detections (e.g. YOLO double-detecting a Title exactly on top of itself)
+            if args.iou_filter > 0:
+                original_count = len(elements)
+                elements = filter_duplicate_elements(elements, iou_threshold=args.iou_filter)
+                if len(elements) < original_count:
+                    print(f"  [CLEANUP] Removed {original_count - len(elements)} duplicate overlapping elements detected by YOLO.")
+                
+            print(f"[LAYOUT] Detected {len(elements)} unique structural elements on Page {i+1}:")
             for _, cat_name in elements:
                 print(f"  - {cat_name}")
                 
@@ -306,9 +438,41 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model)
                     # Remove the caption layout node entirely from the flow so we don't accidentally treat it like a normal text block
                     elements[cap_idx][1] = "abandon" 
             
-            # Phase 2: KMeans Multi-Column Processing Pipeline
-            print("  [ANALYSIS] Calculating document reading flow (KMeans Multi-Column)...")
-            elements = sort_elements_multicolumn(elements, page_width)
+            # Phase 2: Processing Pipeline
+            bands = []
+            column_separators = []
+            if args.enable_kmeans:
+                print("  [ANALYSIS] Calculating document reading flow (KMeans Multi-Column)...")
+                elements, bands, column_separators = sort_elements_multicolumn(elements, page_width)
+            else:
+                print("  [ANALYSIS] Skpping KMeans, using standard Vertical Reading flow...")
+                elements.sort(key=lambda x: (x[0][1] // 20, x[0][0]))
+            
+            if args.draw_pdf:
+                h, w = page_img.shape[:2]
+                
+                # Draw Band Separators (Horizontal)
+                if bands:
+                    for (b_top, b_bottom) in bands:
+                        y_start = max(0, int(b_top))
+                        y_end = min(h, int(b_bottom)) if b_bottom != float('inf') else h
+                        
+                        # Draw bright purple horizontal lines to indicate KMeans Vertical Slice Regions!
+                        # Don't draw if it's strictly on the edge of the screen!
+                        if y_start > 0:
+                            cv2.line(vis_img, (0, y_start), (w, y_start), (255, 0, 255), 5) 
+                        if y_end < h:
+                            cv2.line(vis_img, (0, y_end), (w, y_end), (255, 0, 255), 5)
+                            
+                # Draw Column Separators (Vertical)
+                if column_separators:
+                    for (mid_x, b_top, b_bottom) in column_separators:
+                        y_start = max(0, int(b_top))
+                        y_end = min(h, int(b_bottom)) if b_bottom != float('inf') else h
+                        x_pos = int(mid_x)
+                        
+                        # Draw cyan vertical lines separating the KMeans columns
+                        cv2.line(vis_img, (x_pos, y_start), (x_pos, y_end), (255, 255, 0), 5) 
             
             for j, (xyxy, cat_name) in enumerate(elements):
                 x_min, y_min, x_max, y_max = map(int, xyxy)
@@ -319,6 +483,14 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model)
                 x_max, y_max = min(w, x_max), min(h, y_max)
                 
                 cat_norm = cat_name.lower().replace("_", " ")
+                
+                if args.draw_pdf:
+                    # Draw Visual Debugging Box and KMeans Reading Order Index
+                    color = VIS_COLORS.get(cat_norm, (0, 255, 255)) # Default yellow
+                    cv2.rectangle(vis_img, (x_min, y_min), (x_max, y_max), color, 3)
+                    # Position number near the top-left of the box (Red with thick white outline)
+                    cv2.putText(vis_img, str(j + 1), (x_min + 5, y_min + 65), cv2.FONT_HERSHEY_DUPLEX, 2.5, (255, 255, 255), 10) # Thick White Outline
+                    cv2.putText(vis_img, str(j + 1), (x_min + 5, y_min + 65), cv2.FONT_HERSHEY_DUPLEX, 2.5, (0, 0, 255), 4) # Bright Red Inside
                 
                 if cat_norm == "abandon":
                     continue  # Will skip regions naturally flagged as junk, AND the captions we just processed above!
@@ -337,7 +509,7 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model)
                             # Extract bounded text from the PDF directly
                             pdf_text = doc[i].get_textbox(fitz_rect).strip()
                             if pdf_text:
-                                extracted_text = pdf_text
+                                extracted_text = clean_extracted_text(pdf_text)
                         except Exception as e:
                             pass
                     
@@ -420,15 +592,33 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model)
         with open(output_md_path, "a", encoding="utf-8") as f:
             f.write("\n".join(md_content))
             
-        del page_img, page_img_rgb, pil_img_rgb  # Force free memory references to large arrays
+        # Register Annotated Page if visualizing
+        if args.draw_pdf:
+            vis_pil = Image.fromarray(cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB))
+            annotated_pages.append(vis_pil)
+        
+        del page_img, page_img_rgb, pil_img_rgb, vis_img  # Force free memory references to large arrays
         
     if doc:
         doc.close()
+        
+    # Compile the Visual Layout Debug PDF
+    if args.draw_pdf and annotated_pages:
+        vis_pdf_path = output_md_path.replace('.md', '_visual_layout.pdf')
+        annotated_pages[0].save(vis_pdf_path, save_all=True, append_images=annotated_pages[1:], resolution=300.0)
+        print(f"  [DEBUG] Complete Layout Visualization PDF successfully saved to -> {vis_pdf_path}")
 
     print(f"\n[DONE] Layout parsing complete. Markdown successfully saved to {output_md_path}\n")
 
 if __name__ == "__main__":
-    target_path = "pdf_dataset"
+    parser = argparse.ArgumentParser(description='Parse PDFs/Images into structurally organized Markdown with Layout YOLO.')
+    parser.add_argument('target_path', nargs='?', default="pdf_dataset", help='System path to a PDF, Image, or Directory. (Default: "pdf_dataset")')
+    parser.add_argument('--no-kmeans', dest='enable_kmeans', action='store_false', default=True, help='Disable the multi-column KMeans algorithm entirely (falls back to vertical sweep). (Default: KMeans Enabled)')
+    parser.add_argument('--no-pdf', dest='draw_pdf', action='store_false', default=True, help='Disable the generation of the companion visual layout debug PDF. (Default: PDF Generation Enabled)')
+    parser.add_argument('--iou-filter', type=float, default=0.85, help='Threshold [0.0 - 1.0]. Deletes perfectly overlapping bounding boxes of the same type (e.g., 0.85 = drops duplicates that share 85 percent area. Set to 0 to disable mathematically). (Default: 0.85)')
+    
+    args = parser.parse_args()
+    target_path = args.target_path
     
     # Establish root Output Directory wherever the script is run
     root_output_dir = "output"
@@ -481,7 +671,7 @@ if __name__ == "__main__":
                 output_md = os.path.join(root_output_dir, "mds", f"{safe_name}.md")
                 output_images = os.path.join(root_output_dir, "images", safe_name)
                 
-                process_pdf_to_markdown(file_path, output_md, output_images, model)
+                process_pdf_to_markdown(file_path, output_md, output_images, model, args)
     else:
         # Standard Single File execution
         base_name = os.path.splitext(os.path.basename(target_path))[0]
@@ -490,4 +680,4 @@ if __name__ == "__main__":
         output_md = os.path.join(root_output_dir, "mds", f"{safe_name}.md")
         output_images = os.path.join(root_output_dir, "images", safe_name)
         
-        process_pdf_to_markdown(target_path, output_md, output_images, model)
+        process_pdf_to_markdown(target_path, output_md, output_images, model, args)
