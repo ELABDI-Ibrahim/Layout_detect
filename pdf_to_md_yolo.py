@@ -6,6 +6,7 @@ import fitz  # PyMuPDF
 import numpy as np
 import pytesseract
 from PIL import Image
+from sklearn.cluster import KMeans
 
 try:
     from doclayout_yolo import YOLOv10
@@ -57,6 +58,101 @@ def detect_ocr_language(sample_text):
         return LANG_MAP.get(iso_code, 'eng') # Fallback to English if unknown mapping
     except:
         return 'eng'
+
+def sort_elements_multicolumn(elements, page_width):
+    if not elements:
+        return []
+        
+    # 1. Identify wide elements (>60% page width) to serve as column breakers
+    wide_elements_idx = []
+    for idx, (xyxy, name) in enumerate(elements):
+        w = xyxy[2] - xyxy[0]
+        if w > 0.6 * page_width:
+            wide_elements_idx.append(idx)
+            
+    wide_elements_idx.sort(key=lambda i: elements[i][0][1])
+
+    # 2. Slice page horizontally by the breakers
+    bands = []
+    current_y = 0
+    wide_bounds = []
+    
+    for idx in wide_elements_idx:
+        xyxy = elements[idx][0]
+        y_min, y_max = xyxy[1], xyxy[3]
+        if y_min > current_y:
+            bands.append((current_y, y_min))
+        wide_bounds.append((idx, y_min, y_max))
+        current_y = y_max
+        
+    bands.append((current_y, float('inf')))
+    print(f"  [KMEANS] Page separated into {len(bands)} vertical bands broken by {len(wide_elements_idx)} wide-spanning titles/images.")
+    
+    placed_indices = set(wide_elements_idx)
+    sorted_output = []
+    
+    band_queue_idx = 0
+    wide_queue_idx = 0
+    
+    # 3. Process the bands using KMeans horizontally
+    while band_queue_idx < len(bands):
+        b_top, b_bottom = bands[band_queue_idx]
+        band_elements = []
+        band_original_indices = []
+        
+        for idx, (xyxy, _) in enumerate(elements):
+            if idx in placed_indices: continue
+            y_center = (xyxy[1] + xyxy[3]) / 2
+            # Handle float('inf') math gracefully
+            bottom_val = b_bottom if b_bottom != float('inf') else float('inf')
+            
+            if b_top <= y_center < bottom_val:
+                band_elements.append(elements[idx])
+                band_original_indices.append(idx)
+                placed_indices.add(idx)
+                
+        if band_elements:
+            x_centers = np.array([get_center(e[0])[0] for e in band_elements]).reshape(-1, 1)
+            n_cols = 2 if len(band_elements) >= 2 else 1
+            print(f"  [KMEANS] Scanning Band {band_queue_idx + 1} ({len(band_elements)} elements) -> Grouping into {n_cols} columns.")
+            
+            try:
+                # Use cluster center sorting to determine left-vs-right columns dynamically
+                kmeans = KMeans(n_clusters=n_cols, random_state=0, n_init='auto').fit(x_centers)
+                col_assignment = kmeans.labels_
+                col_order = np.argsort(kmeans.cluster_centers_.flatten())
+                
+                col_groups = {i: [] for i in range(n_cols)}
+                for i, col_idx in enumerate(col_assignment):
+                    col_groups[col_idx].append(band_elements[i])
+                    
+                for col_idx in col_groups:
+                    col_groups[col_idx].sort(key=lambda x: x[0][1]) 
+                    
+                for col_idx in col_order:
+                    sorted_output.extend(col_groups[col_idx])
+                    
+            except Exception as e:
+                print(f"  [WARN] KMeans failed on this band ({e}). Defaulting to standard Y sort.")
+                band_elements.sort(key=lambda x: (x[0][1] // 20, x[0][0]))
+                sorted_output.extend(band_elements)
+
+        band_queue_idx += 1
+        
+        # Append the wide element separator back into the flow
+        if wide_queue_idx < len(wide_bounds):
+            wide_idx = wide_bounds[wide_queue_idx][0]
+            sorted_output.append(elements[wide_idx])
+            wide_queue_idx += 1
+            
+    # Sweep stragglers strictly by reading order
+    stragglers = [elements[i] for i in range(len(elements)) if i not in placed_indices]
+    if stragglers:
+        print(f"  [KMEANS] Sweeping up {len(stragglers)} stray blocks via standard layout fallback.")
+        stragglers.sort(key=lambda x: (x[0][1] // 20, x[0][0]))
+        sorted_output.extend(stragglers)
+        
+    return sorted_output
 
 # ... Inside process_pdf_to_markdown ...
 def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model):
@@ -116,6 +212,10 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model)
         pil_img_rgb = Image.fromarray(page_img_rgb)
         
         # YOLO layout prediction
+        
+        # We need the real page width to orchestrate columns
+        page_width = page_img.shape[1]
+        
         det_res = model.predict(
             pil_img_rgb,
             imgsz=1024,
@@ -139,28 +239,39 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model)
             for _, cat_name in elements:
                 print(f"  - {cat_name}")
                 
-            # Filter and pre-match captions to the geometrically nearest figure or table BEFORE converting to Markdown
-            image_elements = [(j, e) for j, e in enumerate(elements) if e[1].lower().replace("_", " ") in ["figure", "table"]]
-            caption_elements = [(j, e) for j, e in enumerate(elements) if "caption" in e[1].lower()]
+            # Phase 1: STRICT Caption to Image Mapping Logic
+            caption_mapping = {}  
             
-            caption_mapping = {}  # { element_index_of_image : "extracted text of caption" }
+            search_rules = {
+                "figure caption": ["figure"],
+                "table caption": ["table"],
+                "formula caption": ["isolate formula"]
+            }
             
-            # Phase 1: Analyze bounding coordinate proximity and link physical captions to physical images
+            caption_elements = [(j, e) for j, e in enumerate(elements) if e[1].lower().replace("_", " ") in search_rules]
+            image_elements = [(j, e) for j, e in enumerate(elements) if e[1].lower().replace("_", " ") in ["figure", "table", "isolate formula"]]
+            
             for cap_idx, cap_elem in caption_elements:
                 cap_xyxy, cap_name = cap_elem
+                cap_name_lower = cap_name.lower().replace("_", " ")
+                valid_target_types = search_rules.get(cap_name_lower, [])
+                
                 cap_center = get_center(cap_xyxy)
                 
                 closest_img_idx = None
                 shortest_dist = float('inf')
                 
-                for img_idx, img_elem in image_elements:
+                for img_idx, img_elem in enumerate(elements):
                     img_xyxy, img_name = img_elem
-                    img_center = get_center(img_xyxy)
-                    dist = get_distance(cap_center, img_center)
+                    img_name_lower = img_name.lower().replace("_", " ")
                     
-                    if dist < shortest_dist:
-                        shortest_dist = dist
-                        closest_img_idx = img_idx
+                    if img_name_lower in valid_target_types:
+                        img_center = get_center(img_xyxy)
+                        dist = get_distance(cap_center, img_center)
+                        
+                        if dist < shortest_dist:
+                            shortest_dist = dist
+                            closest_img_idx = img_idx
                 
                 if closest_img_idx is not None:
                     # Physically extract the text from the caption BEFORE standard pipeline so we can hold the text string
@@ -185,7 +296,7 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model)
                             extracted_text = pytesseract.image_to_string(gray, lang=detected_lang or 'eng').strip()
                     
                     if extracted_text:
-                        print(f"  [GEOMETRY] Successfully Paired '{cap_name}' ({extracted_text[:30]}...) to image element #{closest_img_idx}")
+                        print(f"  [GEOMETRY] Strictly Paired '{cap_name}' ({extracted_text[:20]}...) to '{elements[closest_img_idx][1]}' #{closest_img_idx}")
                         # Attach text mapping
                         if closest_img_idx in caption_mapping:
                             caption_mapping[closest_img_idx] += " " + extracted_text
@@ -195,9 +306,9 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model)
                     # Remove the caption layout node entirely from the flow so we don't accidentally treat it like a normal text block
                     elements[cap_idx][1] = "abandon" 
             
-            # Phase 2: Pipeline
-            # Sort elements vertically (top to bottom), incorporating a small margin for horizontal sorting
-            elements.sort(key=lambda x: (x[0][1] // 20, x[0][0]))
+            # Phase 2: KMeans Multi-Column Processing Pipeline
+            print("  [ANALYSIS] Calculating document reading flow (KMeans Multi-Column)...")
+            elements = sort_elements_multicolumn(elements, page_width)
             
             for j, (xyxy, cat_name) in enumerate(elements):
                 x_min, y_min, x_max, y_max = map(int, xyxy)
@@ -345,14 +456,19 @@ if __name__ == "__main__":
     if os.path.isdir(target_path):
         print(f"Directory detected. Batch processing all images and PDFs in {target_path}...")
         
-        # Collect all valid image/document formats and sort alphabetically
+        # Collect all valid image/document formats (case-insensitive deduplication)
         valid_extensions = ('.pdf', '.jpg', '.jpeg', '.png')
-        all_files = []
-        for ext in valid_extensions:
-            all_files.extend(glob.glob(os.path.join(target_path, f"*{ext}")))
-            all_files.extend(glob.glob(os.path.join(target_path, f"*{ext.upper()}")))
+        all_files_set = set()
         
-        all_files.sort()
+        for ext in valid_extensions:
+            # Add exact matches
+            for f in glob.glob(os.path.join(target_path, f"*{ext}")):
+                all_files_set.add(os.path.abspath(f))
+            # Add uppercase matches (like .PDF)
+            for f in glob.glob(os.path.join(target_path, f"*{ext.upper()}")):
+                all_files_set.add(os.path.abspath(f))
+        
+        all_files = sorted(list(all_files_set))
         
         if not all_files:
             print("No valid PDF or Image files found in the directory.")

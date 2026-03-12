@@ -5,12 +5,12 @@
 N. Cartigliaa,∗, A. R. Altamurad,a, R. Arcidiaconoa,b, M. Durandod, S. Gallettod, M. Ferreroa, L. Lanterid,a, A.
 Losanad,a, L. Massaccesid,a, L. Menzioc, F. Sivieroa, V. Solad,a, R. Whited,a
 
+## Abstract
+
 aINFN sezione di Torino, Torino, Italy
 bUniversit`a del Piemonte Orientale, Novara, Italy
 cCERN, Geneva, Switzerland
 dUniversit`a degli Studi di Torino, Torino, Italy
-
-## Abstract
 
 The temporal resolution of Low-Gain Avalanche Detectors (LGADs), also known as Ultra-Fast Silicon Detectors
 (UFSDs), is governed by two contributions: jitter, arising from electronic noise and signal slew rate, and the Landau
@@ -31,6 +31,33 @@ detectors
 
 ## 1. Introduction
 
+Low-Gain Avalanche Detectors (LGADs) [1, 2] are
+silicon sensors that exploit a moderate internal gain
+(∼10–40) to achieve excellent single-layer temporal
+resolution, routinely below 50 ps [4].
+Their timing
+performance is central to several detector upgrades at
+the High-Luminosity LHC, including the CMS Endcap
+Timing Layer (ETL) and the ATLAS High-Granularity
+Timing Detector (HGTD) [5, 6].
+
+Despite their widespread use, a complete quantitative
+understanding of why LGADs achieve such good timing
+is still being developed. This work addresses that ques-
+tion from first principles, tracing the signal formation
+chain from the initial ionization through drift and multi-
+plication, and identifying the physical mechanisms that
+govern the intrinsic temporal resolution.
+
+All
+simulation
+results
+presented
+in
+this
+pa-
+per were obtained with the Weightfield2 (WF2)
+
 program
 [7],
 a
@@ -46,16 +73,6 @@ sensors
 available
 at
 https://www.to.infn.it/~cartigli/Weightfield2/.
-
-Low-Gain Avalanche Detectors (LGADs) [1, 2] are
-silicon sensors that exploit a moderate internal gain
-(∼10–40) to achieve excellent single-layer temporal
-resolution, routinely below 50 ps [4].
-Their timing
-performance is central to several detector upgrades at
-the High-Luminosity LHC, including the CMS Endcap
-Timing Layer (ETL) and the ATLAS High-Granularity
-Timing Detector (HGTD) [5, 6].
 
 The paper is organized as follows.
 Section 2 de-
@@ -79,23 +96,6 @@ Section 9 introduces a novel data-driven gain measure-
 ment method.
 Section 10 discusses implications for
 
-Despite their widespread use, a complete quantitative
-understanding of why LGADs achieve such good timing
-is still being developed. This work addresses that ques-
-tion from first principles, tracing the signal formation
-chain from the initial ionization through drift and multi-
-plication, and identifying the physical mechanisms that
-govern the intrinsic temporal resolution.
-
-All
-simulation
-results
-presented
-in
-this
-pa-
-per were obtained with the Weightfield2 (WF2)
-
 March 12, 2026
 
 
@@ -103,14 +103,6 @@ March 12, 2026
 
 gain layer design. Section 11 summarizes the conclu-
 sions.
-
-![Image associated with caption: Figure 1: Measured (red) and WF2-simulated Landau energy distribu-
-tions (blue). The simulation correctly reproduces both the MPV and
-the FWHM as a function of sensor thickness. (1) (2) (3) (4)](..\images\two_columns_test\page_2_figure_1.jpg)
-
-*Figure 1: Measured (red) and WF2-simulated Landau energy distribu-
-tions (blue). The simulation correctly reproduces both the MPV and
-the FWHM as a function of sensor thickness. (1) (2) (3) (4)*
 
 ## 2. MIP Ionization in Silicon Sensors
 
@@ -153,6 +145,50 @@ these are modeled as a Gaussian contribution with
 mean µsoft(d) and standard deviation σsoft per mi-
 cron slice.
 
+• A hard scattering component, corresponding to
+more energetic collisions sampled from the 1/T 2
+distribution over [Tmin, Tmax], that produce δ-rays
+— knock-on electrons carrying significant kinetic
+energy away from the primary track. The value of
+Tmin sets the width of this energy range and hence
+the normalisation of the distribution. A δ-ray with
+T ∼30–100 keV can travel tens of microns from
+the primary track. These events populate the high-
+energy Landau tail.
+
+Concretely, in each 1-µm slice the number of hard
+collisions N is drawn from a Poisson distribution with
+mean ν · ∆x, where ν is the mean collision rate per mi-
+cron. Each collision energy is sampled from the trun-
+cated 1/T 2 distribution using the exact inverse-CDF
+method:
+
+![Image associated with caption: (1)](..\images\two_columns_test\page_2_isolate_formula_9.jpg)
+
+*(1)*
+
+with Tmin = 26 eV and Tmax = 600 keV. The results are
+insensitive to Tmax for values above ∼200 keV, as the
+1/T 2 spectrum strongly suppresses large energy trans-
+fers. The soft component is added as an independent
+Gaussian draw (µsoft, σsoft = 10 eV) per micron. The
+total slice energy (hard + soft) is converted to electron-
+hole pairs using the mean ionisation energy in silicon,
+ϵ = 3.6 eV/pair. Both ν and µsoft depend on sensor thick-
+ness following empirical scaling relations:
+
+![Image associated with caption: (2)](..\images\two_columns_test\page_2_isolate_formula_12.jpg)
+
+*(2)*
+
+![Image associated with caption: Figure 1: Measured (red) and WF2-simulated Landau energy distribu-
+tions (blue). The simulation correctly reproduces both the MPV and
+the FWHM as a function of sensor thickness.](..\images\two_columns_test\page_2_figure_16.jpg)
+
+*Figure 1: Measured (red) and WF2-simulated Landau energy distribu-
+tions (blue). The simulation correctly reproduces both the MPV and
+the FWHM as a function of sensor thickness.*
+
 This thickness dependence reflects the fact that the rel-
 ative weight of the hard and soft components in the en-
 ergy deposition changes systematically with thickness.
@@ -167,31 +203,15 @@ sured MPV [8] and FWHM of the Landau distribution
 as a function of sensor thickness (Figure 1), confirming
 the validity of the ionization model.
 
-• A hard scattering component, corresponding to
-more energetic collisions sampled from the 1/T 2
-distribution over [Tmin, Tmax], that produce δ-rays
-— knock-on electrons carrying significant kinetic
-energy away from the primary track. The value of
-Tmin sets the width of this energy range and hence
-the normalisation of the distribution. A δ-ray with
-T ∼30–100 keV can travel tens of microns from
-the primary track. These events populate the high-
-energy Landau tail.
-
 ## 2.2. Long-Range Correlations from Delta Rays
 
 In WF2, each δ-ray of energy T is assigned a range
 using the empirical CSDA relation for electrons in sili-
 con [10]:
 
-Concretely, in each 1-µm slice the number of hard
-collisions N is drawn from a Poisson distribution with
-mean ν · ∆x, where ν is the mean collision rate per mi-
-cron. Each collision energy is sampled from the trun-
-cated 1/T 2 distribution using the exact inverse-CDF
-method:
+![Image associated with caption: (3)](..\images\two_columns_test\page_2_isolate_formula_21.jpg)
 
-![isolate_formula](..\images\two_columns_test\page_2_isolate_formula_14.jpg)
+*(3)*
 
 δ-rays with R < 2 µm deposit their energy locally at
 the point of creation.
@@ -200,19 +220,9 @@ distributed along the track using a power-law stopping
 profile derived by inverting Eq. (3) (R ∝T 1.75 implies
 T ∝R1/1.75):
 
-![isolate_formula](..\images\two_columns_test\page_2_isolate_formula_17.jpg)
+![Image associated with caption: (4)](..\images\two_columns_test\page_2_isolate_formula_24.jpg)
 
-with Tmin = 26 eV and Tmax = 600 keV. The results are
-insensitive to Tmax for values above ∼200 keV, as the
-1/T 2 spectrum strongly suppresses large energy trans-
-fers. The soft component is added as an independent
-Gaussian draw (µsoft, σsoft = 10 eV) per micron. The
-total slice energy (hard + soft) is converted to electron-
-hole pairs using the mean ionisation energy in silicon,
-ϵ = 3.6 eV/pair. Both ν and µsoft depend on sensor thick-
-ness following empirical scaling relations:
-
-![isolate_formula](..\images\two_columns_test\page_2_isolate_formula_20.jpg)
+*(4)*
 
 so that the energy deposited in each 1-µm slice is the dif-
 ference in remaining energy between its start and end.
@@ -222,23 +232,11 @@ so that the deposited energy per slice rises toward the
 end of the range. If the range of a δ-ray exceeds the re-
 maining distance to the sensor edge, energy deposition
 
-![isolate_formula](..\images\two_columns_test\page_2_isolate_formula_23.jpg)
-
 
 --- End of Page 2 ---
 
 is truncated at the boundary and the remaining energy
 escapes the sensor undetected.
-
-![Image associated with caption: Figure 2: Measured values of the Landau noise as a function of sensor
-thickness and a line that shows the ∝
-√
-d behaviour. (8) (7) (6) (5)](..\images\two_columns_test\page_3_figure_1.jpg)
-
-*Figure 2: Measured values of the Landau noise as a function of sensor
-thickness and a line that shows the ∝
-√
-d behaviour. (8) (7) (6) (5)*
 
 ## 3. Components of the Temporal Resolution
 
@@ -247,34 +245,16 @@ d behaviour. (8) (7) (6) (5)*
 The temporal resolution σt of an LGAD is decom-
 posed into two independent contributions [3]:
 
-![isolate_formula](..\images\two_columns_test\page_3_isolate_formula_6.jpg)
+![Image associated with caption: (5)](..\images\two_columns_test\page_3_isolate_formula_4.jpg)
 
-where n is the linear density of electron-hole pairs (pairs
-per unit length). For the MIP case, the charge depo-
-sition is non-uniform and the analytical treatment be-
-comes significantly more complex; the full derivation is
-given in [9].
+*(5)*
 
 Jitter arises from electronic noise σV and the signal
 slew rate dV/dt at threshold crossing:
 
-![isolate_formula](..\images\two_columns_test\page_3_isolate_formula_10.jpg)
+![Image associated with caption: (6)](..\images\two_columns_test\page_3_isolate_formula_7.jpg)
 
-Equation (8) reveals the fundamental structure of the
-Landau noise: it grows with the square root of the thick-
-ness and decreases with drift velocity.
-Operating at
-fields sufficient to saturate the drift velocity v, and re-
-ducing sensor thickness, are the most effective ways to
-reduce this term. Specifically, for the MIP case, the N
-charge carriers are not uniformly distributed but follow
-the non-uniform Landau deposition. The resulting Lan-
-dau noise is larger than for a laser, and its precise value
-depends on the specific ionization pattern in each event
-[9]. Figure 2 shows that the theoretical
-√
-d scaling well
-matches the measured values of Landau noise [11].
+*(6)*
 
 It dominates at low gain, where the signal amplitude is
 small relative to the noise.
@@ -293,8 +273,6 @@ the WF2 simulation.
 
 ## 3.2. Analytical Derivation of the Landau Noise Term
 
-## 4. The Discrepancy Between Simulation and Data
-
 Following Riegler [9], we derive the general features
 of the Landau noise term. Consider a sensor of thick-
 ness d in which a single electron-hole pair is created at
@@ -302,6 +280,57 @@ a random, uniformly distributed position x ∈[0, d]. The
 electron drifts to the collecting electrode with velocity
 v, arriving at time t = x/v. Since x is uniform on [0, d],
 the standard deviation of the arrival time is:
+
+![Image associated with caption: (7)](..\images\two_columns_test\page_3_isolate_formula_14.jpg)
+
+*(7)*
+
+This is the fundamental upper bound on the Landau
+noise: it corresponds to total ignorance of the charge
+creation position. For a laser that deposits N electron-
+hole pairs uniformly along the track, the uncertainty on
+the trigger time improves as 1/
+√
+N (by analogy with the
+mean of N uniform random variables).
+
+![Image associated with caption: (8)](..\images\two_columns_test\page_3_isolate_formula_17.jpg)
+
+*(8)*
+
+![Image associated with caption: Figure 2: Measured values of the Landau noise as a function of sensor
+thickness and a line that shows the ∝
+√
+d behaviour.](..\images\two_columns_test\page_3_figure_20.jpg)
+
+*Figure 2: Measured values of the Landau noise as a function of sensor
+thickness and a line that shows the ∝
+√
+d behaviour.*
+
+where n is the linear density of electron-hole pairs (pairs
+per unit length). For the MIP case, the charge depo-
+sition is non-uniform and the analytical treatment be-
+comes significantly more complex; the full derivation is
+given in [9].
+
+Equation (8) reveals the fundamental structure of the
+Landau noise: it grows with the square root of the thick-
+ness and decreases with drift velocity.
+Operating at
+fields sufficient to saturate the drift velocity v, and re-
+ducing sensor thickness, are the most effective ways to
+reduce this term. Specifically, for the MIP case, the N
+charge carriers are not uniformly distributed but follow
+the non-uniform Landau deposition. The resulting Lan-
+dau noise is larger than for a laser, and its precise value
+depends on the specific ionization pattern in each event
+[9]. Figure 2 shows that the theoretical
+√
+d scaling well
+matches the measured values of Landau noise [11].
+
+## 4. The Discrepancy Between Simulation and Data
 
 Figure 3 compares the measured temporal resolution
 (jitter subtracted, Landau noise contribution only) with
@@ -319,17 +348,6 @@ thickness.
 than the measured one across all sensor thick-
 nesses.
 
-![isolate_formula](..\images\two_columns_test\page_3_isolate_formula_22.jpg)
-
-This is the fundamental upper bound on the Landau
-noise: it corresponds to total ignorance of the charge
-creation position. For a laser that deposits N electron-
-hole pairs uniformly along the track, the uncertainty on
-the trigger time improves as 1/
-√
-N (by analogy with the
-mean of N uniform random variables).
-
 2. The discrepancy grows with increasing sensor
 thickness.
 
@@ -339,8 +357,6 @@ plemented in WF2. Two physical mechanisms, not in-
 cluded in the simulation, are responsible for this dis-
 crepancy: space charge effects during drift and gain sat-
 uration during multiplication.
-
-![isolate_formula](..\images\two_columns_test\page_3_isolate_formula_27.jpg)
 
 
 --- End of Page 3 ---

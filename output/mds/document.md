@@ -98,23 +98,23 @@ formance with simpler language models, making it ideal for
 resource-constrained environments while preserving core RAG
 functionalities.
 
+• Storage Efficiency While Maintaining Performance. Mini-
+RAG demonstrates exceptional storage efficiency while pre-
+serving high accuracy levels. Empirical evaluations show that
+MiniRAG achieves competitive accuracy while requiring only
+25% of the storage space compared to baselines like LightRAG
+
 ![Image associated with caption: Figure 3: Accuracy vs.
 Storage
 Efficiency: Comparative analysis
 of three RAG systems - MiniRAG,
-LightRAG, and GraphRAG. ective for on-device deployment.](..\images\document\page_2_figure_8.jpg)
+LightRAG, and GraphRAG. ective for on-device deployment.](..\images\document\page_2_figure_10.jpg)
 
 *Figure 3: Accuracy vs.
 Storage
 Efficiency: Comparative analysis
 of three RAG systems - MiniRAG,
 LightRAG, and GraphRAG. ective for on-device deployment.*
-
-• Storage Efficiency While Maintaining Performance. Mini-
-RAG demonstrates exceptional storage efficiency while pre-
-serving high accuracy levels. Empirical evaluations show that
-MiniRAG achieves competitive accuracy while requiring only
-25% of the storage space compared to baselines like LightRAG
 
 
 --- End of Page 2 ---
