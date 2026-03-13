@@ -231,6 +231,38 @@ def detect_ocr_language(sample_text):
     except:
         return 'eng'
 
+def extract_pdf_text_center_mass(doc, page_num, fitz_rect):
+    """
+    Safely extracts text, preventing YOLO bounding box bleeding into adjacent lines,
+    by enforcing that a word's mathematical center point must geometrically reside inside the fitz_rect.
+    """
+    if not doc: return ""
+    try:
+        page = doc[page_num]
+        words = page.get_text("words")
+        
+        lines = {}
+        for w in words:
+            x0, y0, x1, y1, text, block_no, line_no, word_no = w
+            
+            center_x = (x0 + x1) / 2
+            center_y = (y0 + y1) / 2
+            
+            if fitz_rect.contains(fitz.Point(center_x, center_y)):
+                key = (block_no, line_no)
+                if key not in lines:
+                    lines[key] = []
+                lines[key].append(w)
+                
+        text_lines = []
+        for key in sorted(lines.keys()):
+            line_words = sorted(lines[key], key=lambda x: x[7])
+            text_lines.append(" ".join([w[4] for w in line_words]))
+            
+        return "\n".join(text_lines)
+    except Exception as e:
+        return ""
+
 def extract_title_font_size(doc, page_num, fitz_rect):
     """
     Extracts the median font_size of the text enclosed in the rectangle.
@@ -239,12 +271,21 @@ def extract_title_font_size(doc, page_num, fitz_rect):
     if not doc: return None
     try:
         page = doc[page_num]
-        words = page.get_text("dict", clip=fitz_rect)
+        words = page.get_text("dict")
         sizes = []
         for block in words.get("blocks", []):
+            if block.get("type", 0) != 0: continue
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
-                    sizes.append(span.get("size", 0))
+                    bbox = span.get("bbox", [])
+                    if not bbox or len(bbox) != 4: continue
+                    center_x = (bbox[0] + bbox[2]) / 2
+                    center_y = (bbox[1] + bbox[3]) / 2
+                    
+                    if fitz_rect.contains(fitz.Point(center_x, center_y)):
+                        text = span.get("text", "").strip()
+                        if text:
+                            sizes.append(span.get("size", 0))
         if sizes:
             sizes.sort()
             return sizes[len(sizes)//2] # Return median to ignore weird stray characters
@@ -260,7 +301,7 @@ def check_bold_title_promotion(doc, page_num, fitz_rect):
     if not doc: return False
     try:
         page = doc[page_num]
-        words = page.get_text("dict", clip=fitz_rect)
+        words = page.get_text("dict")
         
         has_text = False
         for block in words.get("blocks", []):
@@ -269,21 +310,27 @@ def check_bold_title_promotion(doc, page_num, fitz_rect):
                 
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
-                    text = span.get("text", "").strip()
-                    if not text: continue # Ignore empty whitespace spans
+                    bbox = span.get("bbox", [])
+                    if not bbox or len(bbox) != 4: continue
+                    center_x = (bbox[0] + bbox[2]) / 2
+                    center_y = (bbox[1] + bbox[3]) / 2
                     
-                    has_text = True
-                    font_flags = span.get("flags", 0)
-                    font_name = span.get("font", "").lower()
-                    
-                    # 16 is the bitmask for bold in PyMuPDF's span flags
-                    is_bold_flag = bool(font_flags & 16)
-                    is_bold_name = "bold" in font_name or "black" in font_name or "heavy" in font_name
-                    
-                    # If ANY valid textual span inside this bounding box is NOT bold, the promotion fails!
-                    if not (is_bold_flag or is_bold_name):
-                        return False
+                    if fitz_rect.contains(fitz.Point(center_x, center_y)):
+                        text = span.get("text", "").strip()
+                        if not text: continue # Ignore empty whitespace spans
                         
+                        has_text = True
+                        font_flags = span.get("flags", 0)
+                        font_name = span.get("font", "").lower()
+                        
+                        # 16 is the bitmask for bold in PyMuPDF's span flags
+                        is_bold_flag = bool(font_flags & 16)
+                        is_bold_name = "bold" in font_name or "black" in font_name or "heavy" in font_name
+                        
+                        # If ANY valid textual span inside this bounding box is NOT bold, the promotion fails!
+                        if not (is_bold_flag or is_bold_name):
+                            return False
+                            
         # If we found valid text and never triggered the non-bold failure condition, it is a pure bold box!
         return has_text 
     except Exception as e:
@@ -603,8 +650,7 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
     detected_lang = None # Will figure this out on the first chunk of text
     annotated_pages = [] # Will store visual debugging representations
     raw_annotated_pages = [] # Will store raw YOLO visualizations before any heuristics
-    caption_padding = 20
-    
+
     # Master collection of observed Title Font Sizes (so we can determine what H1/H2 sizes are)
     seen_title_font_sizes = set()
     # Track titles to defer heading level resolution until we've parsed the full document
@@ -741,7 +787,7 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
                         scale = 72 / 300
                         fitz_rect = fitz.Rect(x_min * scale, y_min * scale, x_max * scale, y_max * scale)
                         try:
-                            pdf_text = doc[i].get_textbox(fitz_rect).strip()
+                            pdf_text = extract_pdf_text_center_mass(doc, i, fitz_rect).strip()
                             if pdf_text: extracted_text = pdf_text
                         except Exception as e: pass
                     
@@ -831,7 +877,7 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
                         fitz_rect = fitz.Rect(x_min * scale, y_min * scale, x_max * scale, y_max * scale)
                         try:
                             # Extract bounded text from the PDF directly
-                            pdf_text = doc[i].get_textbox(fitz_rect).strip()
+                            pdf_text = extract_pdf_text_center_mass(doc, i, fitz_rect).strip()
                             if pdf_text:
                                 extracted_text = clean_extracted_text(pdf_text)
                                 
