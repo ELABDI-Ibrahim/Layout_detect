@@ -252,6 +252,45 @@ def extract_title_font_size(doc, page_num, fitz_rect):
         pass
     return None
 
+def check_bold_title_promotion(doc, page_num, fitz_rect):
+    """
+    Evaluates if ALL text within a bounding box is bold.
+    Returns True if entire box is bold text, False otherwise.
+    """
+    if not doc: return False
+    try:
+        page = doc[page_num]
+        words = page.get_text("dict", clip=fitz_rect)
+        
+        has_text = False
+        for block in words.get("blocks", []):
+            if block.get("type", 0) != 0: # Only analyze text blocks
+                continue
+                
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = span.get("text", "").strip()
+                    if not text: continue # Ignore empty whitespace spans
+                    
+                    has_text = True
+                    font_flags = span.get("flags", 0)
+                    font_name = span.get("font", "").lower()
+                    
+                    # 16 is the bitmask for bold in PyMuPDF's span flags
+                    is_bold_flag = bool(font_flags & 16)
+                    is_bold_name = "bold" in font_name or "black" in font_name or "heavy" in font_name
+                    
+                    # If ANY valid textual span inside this bounding box is NOT bold, the promotion fails!
+                    if not (is_bold_flag or is_bold_name):
+                        return False
+                        
+        # If we found valid text and never triggered the non-bold failure condition, it is a pure bold box!
+        return has_text 
+    except Exception as e:
+        pass
+        
+    return False
+
 def infer_heading_level(text, font_size, seen_fonts):
     """
     1) Try Numbering (e.g., '1.2.1 Details')
@@ -563,6 +602,7 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
 
     detected_lang = None # Will figure this out on the first chunk of text
     annotated_pages = [] # Will store visual debugging representations
+    raw_annotated_pages = [] # Will store raw YOLO visualizations before any heuristics
     caption_padding = 20
     
     # Master collection of observed Title Font Sizes (so we can determine what H1/H2 sizes are)
@@ -595,6 +635,7 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
         page_img_rgb = cv2.cvtColor(page_img, cv2.COLOR_BGR2RGB)
         pil_img_rgb = Image.fromarray(page_img_rgb)
         vis_img = page_img.copy() # Clone image for visualization
+        raw_vis_img = page_img.copy() # Clone image specifically for raw YOLO un-altered visualization
         
         # YOLO layout prediction
         
@@ -630,6 +671,29 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
             print(f"[LAYOUT] Detected {len(elements)} unique structural elements on Page {i+1}:")
             for _, cat_name in elements:
                 print(f"  - {cat_name}")
+                
+            # --- Draw Raw YOLO Predictions before ANY layout/caption heuristics ---
+            if args.draw_pdf:
+                for xyxy, cat_name in elements:
+                    x_min, y_min, x_max, y_max = map(int, xyxy)
+                    h, w = page_img.shape[:2]
+                    x_min, y_min = max(0, x_min), max(0, y_min)
+                    x_max, y_max = min(w, x_max), min(h, y_max)
+                    
+                    cat_norm = cat_name.lower().replace("_", " ")
+                    color = VIS_COLORS.get(cat_norm, (0, 255, 255))
+                    
+                    # Draw thick bounding box
+                    cv2.rectangle(raw_vis_img, (x_min, y_min), (x_max, y_max), color, 4)
+                    
+                    # Draw enlarged, highly visible class label slightly above the top border
+                    # Ensures it does not clip off the top of the page if the box is at y=0
+                    label_y = max(35, y_min - 10) 
+                    
+                    # Draw thick black outline for extreme contrast, then color fill
+                    label_text = cat_name.upper()
+                    cv2.putText(raw_vis_img, label_text, (x_min, label_y), cv2.FONT_HERSHEY_DUPLEX, 1.2, (0, 0, 0), 8)
+                    cv2.putText(raw_vis_img, label_text, (x_min, label_y), cv2.FONT_HERSHEY_DUPLEX, 1.2, color, 2)
                 
             # Phase 1: STRICT Caption to Image Mapping Logic
             caption_mapping = {}  
@@ -771,6 +835,13 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
                             if pdf_text:
                                 extracted_text = clean_extracted_text(pdf_text)
                                 
+                                # Dynamic Bold-to-Title Promotion
+                                if cat_norm != "title" and args.enable_bold_title:
+                                    is_fully_bold = check_bold_title_promotion(doc, i, fitz_rect)
+                                    if is_fully_bold:
+                                        print(f"  [HEURISTIC] Auto-promoting Bold Text box to 'Title': '{extracted_text[:30]}...'")
+                                        cat_norm = "title"
+                                
                             # Always attempt font extraction for titles to build our H1/H2 map!
                             if cat_norm == "title":
                                 fs = extract_title_font_size(doc, i, fitz_rect)
@@ -894,8 +965,11 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
         if args.draw_pdf:
             vis_pil = Image.fromarray(cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB))
             annotated_pages.append(vis_pil)
+            
+            raw_vis_pil = Image.fromarray(cv2.cvtColor(raw_vis_img, cv2.COLOR_BGR2RGB))
+            raw_annotated_pages.append(raw_vis_pil)
         
-        del page_img, page_img_rgb, pil_img_rgb, vis_img  # Force free memory references to large arrays
+        del page_img, page_img_rgb, pil_img_rgb, vis_img, raw_vis_img  # Force free memory references to large arrays
         
     if doc:
         doc.close()
@@ -932,10 +1006,16 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
                 f.write(full_md_text)
             
     # Compile the Visual Layout Debug PDF
-    if args.draw_pdf and annotated_pages:
-        vis_pdf_path = output_md_path.replace('.md', '_visual_layout.pdf')
-        annotated_pages[0].save(vis_pdf_path, save_all=True, append_images=annotated_pages[1:], resolution=300.0)
-        print(f"  [DEBUG] Complete Layout Visualization PDF successfully saved to -> {vis_pdf_path}")
+    if args.draw_pdf:
+        if annotated_pages:
+            vis_pdf_path = output_md_path.replace('.md', '_visual_layout.pdf')
+            annotated_pages[0].save(vis_pdf_path, save_all=True, append_images=annotated_pages[1:], resolution=300.0)
+            print(f"  [DEBUG] Complete Layout Visualization PDF successfully saved to -> {vis_pdf_path}")
+            
+        if raw_annotated_pages:
+            raw_pdf_path = output_md_path.replace('.md', '_raw_yolo_predictions.pdf')
+            raw_annotated_pages[0].save(raw_pdf_path, save_all=True, append_images=raw_annotated_pages[1:], resolution=300.0)
+            print(f"  [DEBUG] Raw YOLO Predictions PDF successfully saved to -> {raw_pdf_path}")
 
     print(f"\n[DONE] Layout parsing complete. Markdown successfully saved to {output_md_path}\n")
 
@@ -946,6 +1026,7 @@ if __name__ == "__main__":
     parser.add_argument('--no-pdf', dest='draw_pdf', action='store_false', default=True, help='Disable the generation of the companion visual layout debug PDF. (Default: PDF Generation Enabled)')
     parser.add_argument('--iou-filter', type=float, default=0.85, help='Threshold [0.0 - 1.0]. Deletes perfectly overlapping bounding boxes of the same type. (Default: 0.85)')
     parser.add_argument('--enable-heading-hierarchy', dest='enable_heading_hierarchy', action='store_true', default=False, help='Toggles the experimental dynamic H1/H2 font-scaling heuristic algorithm. (Default: Disabled)')
+    parser.add_argument('--enable-bold-title', dest='enable_bold_title', action='store_true', default=False, help='Toggles the promotion of exclusively bold plain text boxes to semantic titles. (Default: Disabled)')
     
     args = parser.parse_args()
     target_path = args.target_path
