@@ -17,6 +17,13 @@ except ImportError:
     sys.exit(1)
 
 try:
+    import camelot
+    from html_to_markdown import convert as html_to_md_convert
+except ImportError:
+    print("camelot-py or html-to-markdown package is not installed. Please install them.")
+    sys.exit(1)
+
+try:
     from langdetect import detect, DetectorFactory
     DetectorFactory.seed = 0 # Enforce consistent language detection
 except ImportError:
@@ -102,8 +109,6 @@ def clean_extracted_text(text):
     result = " ".join(processed_lines)
     result = re.sub(r'\s+', ' ', result)
     return result.strip()
-
-# ... Keep existing imports ...
 
 def sanitize_filename(name):
     """Keep only alphanumeric characters, dashes, and underscores for safe directory creation"""
@@ -551,18 +556,7 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
                     if crop_img.size == 0:
                         continue
                         
-                    # Enforce generic naming scheme logic for tables & figures
-                    cat_safe_name = cat_norm.replace(' ', '_')
-                    if "table" in cat_norm:
-                        cat_safe_name = "table"
-                    
-                    img_filename = f"page_{i+1}_{cat_safe_name}_{j}.jpg"
-                    img_filepath = os.path.join(image_output_dir, img_filename)
-                    cv2.imwrite(img_filepath, crop_img)
-                    
-                    print(f"  [IMAGE DEPLOYED] '{cat_name}' successfully cropped and saved to -> {img_filepath}")
-                    
-                    # Check if this image was geographically paired with a caption text!
+                    # Check if this element was geographically paired with a caption text!
                     # Note: we need to find its pre-sorted index to pull from our mapping
                     original_j = None
                     for orig_idx, orig_elem in image_elements:
@@ -571,17 +565,81 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
                             break
                             
                     paired_caption_text = caption_mapping.get(original_j, None)
-                    
-                    # Store rel_path for pristine Markdown links, not the absolute system path.
-                    rel_img_filepath = os.path.relpath(img_filepath, os.path.dirname(output_md_path))
-                    
-                    if paired_caption_text:
-                         print(f"  [ATTACHING] Injecting paired caption into Markdown below image.")
-                         md_content.append(f"![Image associated with caption: {paired_caption_text}]({rel_img_filepath})")
-                         # Append the caption text openly in Markdown directly underneath!
-                         md_content.append(f"\n*{paired_caption_text}*\n")
-                    else:
-                         md_content.append(f"![{cat_name}]({rel_img_filepath})\n")
+
+                    # Camelot Table Extraction Override
+                    table_extracted = False
+                    if "table" in cat_norm and is_pdf and doc:
+                        try:
+                            # Map 300 DPI YOLO coordinates to 72 DPI PDF coordinates
+                            scale = 72 / 300
+                            pdf_h = doc[i].rect.height
+                            
+                            x1 = max(0, x_min * scale)
+                            y1 = max(0, pdf_h - (y_min * scale)) # Top-Left Y (PDF origin is bottom-left)
+                            x2 = max(0, x_max * scale)
+                            y2 = max(0, pdf_h - (y_max * scale)) # Bottom-Right Y
+
+                            table_area = f"{x1},{y1},{x2},{y2}"
+                            
+                            print(f"  [GEOMETRY] Mapping table crop {table_area} to Camelot Lattice engine...")
+                            tables = camelot.read_pdf(
+                                input_path, 
+                                pages=str(i + 1), 
+                                flavor='hybrid', 
+                                table_areas=[table_area]
+                            )
+                            
+                            if len(tables) > 0:
+                                import tempfile
+                                temp_html = tempfile.mktemp(suffix='.html')
+                                tables[0].to_html(temp_html) # Writes exactly the HTML layout we need
+                                
+                                with open(temp_html, 'r', encoding='utf-8') as html_file:
+                                    html_string = html_file.read()
+                                os.remove(temp_html)
+                                
+                                md_table = html_to_md_convert(html_string)
+                                if md_table and len(md_table.strip()) > 5:
+                                    print(f"  [EXTRACT] (Camelot Table Parse): Successfully converted HTML table to Native Markdown.")
+                                    # Append the parsed Markdown table
+                                    md_content.append(f"{md_table}\n")
+                                    if paired_caption_text:
+                                        md_content.append(f"*{paired_caption_text}*\n")
+                                        
+                                    table_extracted = True
+                                    
+                                # Explicitly delete table objects to release file locks on Windows
+                                del tables
+                                
+                        except Exception as e:
+                            print(f"  [WARN] Camelot extraction failed: {e}")
+                        finally:
+                            # Force Garbage Collection to purge dangling pypdf/ghostscript handles inside Camelot
+                            import gc
+                            gc.collect()
+                            
+                    # Fallback to pure Image logic if Camelot failed or it's a Figure/Formula
+                    if not table_extracted:
+                        # Enforce generic naming scheme logic for tables & figures
+                        cat_safe_name = cat_norm.replace(' ', '_')
+                        if "table" in cat_norm:
+                            cat_safe_name = "table"
+                        
+                        img_filename = f"page_{i+1}_{cat_safe_name}_{j}.jpg"
+                        img_filepath = os.path.join(image_output_dir, img_filename)
+                        cv2.imwrite(img_filepath, crop_img)
+                        
+                        print(f"  [IMAGE DEPLOYED] '{cat_name}' successfully cropped and saved to -> {img_filepath}")
+                        
+                        # Store rel_path for pristine Markdown links
+                        rel_img_filepath = os.path.relpath(img_filepath, os.path.dirname(output_md_path))
+                        
+                        if paired_caption_text:
+                             print(f"  [ATTACHING] Injecting paired caption into Markdown below image.")
+                             md_content.append(f"![Image associated with caption: {paired_caption_text}]({rel_img_filepath})")
+                             md_content.append(f"\n*{paired_caption_text}*\n")
+                        else:
+                             md_content.append(f"![{cat_name}]({rel_img_filepath})\n")
                          
         
         # End of Page separator
@@ -601,6 +659,9 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
         
     if doc:
         doc.close()
+        del doc
+        import gc
+        gc.collect()
         
     # Compile the Visual Layout Debug PDF
     if args.draw_pdf and annotated_pages:
