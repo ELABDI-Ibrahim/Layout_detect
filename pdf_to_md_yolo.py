@@ -19,8 +19,9 @@ except ImportError:
 try:
     import camelot
     from html_to_markdown import convert as html_to_md_convert
+    from bs4 import BeautifulSoup
 except ImportError:
-    print("camelot-py or html-to-markdown package is not installed. Please install them.")
+    print("camelot-py, html-to-markdown, or beautifulsoup4 package is not installed. Please install them.")
     sys.exit(1)
 
 try:
@@ -143,32 +144,82 @@ def calculate_iou(box1, box2):
         return 0
     return intersection / union
 
+def is_contained(box_inner, box_outer, tolerance=0.9):
+    """
+    Returns True if box_inner is almost entirely (e.g. 90%+) inside box_outer.
+    """
+    x_left = max(box_inner[0], box_outer[0])
+    y_top = max(box_inner[1], box_outer[1])
+    x_right = min(box_inner[2], box_outer[2])
+    y_bottom = min(box_inner[3], box_outer[3])
+    
+    if x_right < x_left or y_bottom < y_top:
+        return False
+        
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+    inner_area = (box_inner[2] - box_inner[0]) * (box_inner[3] - box_inner[1])
+    
+    if inner_area == 0:
+        return False
+        
+    return (intersection_area / inner_area) >= tolerance
+
 def filter_duplicate_elements(elements, iou_threshold=0.8):
     """
-    Remove heavily overlapping elements of the EXACT SAME type (like 2 layered titles).
+    Remove heavily overlapping elements of the EXACT SAME type (like 2 layered titles),
+    OR swallow smaller elements strictly contained within larger elements.
     Elements is list: [ [[x1,y1,x2,y2], name], ... ]
     """
     if not elements: return []
     
-    filtered_elements = []
-    # Simple NMS-style filtering: assume list is somewhat raw.
-    # The IoU threshold of 0.8 means if 80% of a box overlaps an identical-class box, drop one.
+    # We will mutate the elements in place for unions, so work on a copy of the list structure
+    working_elements = [[e[0].copy(), e[1]] for e in elements]
     skip_indices = set()
     
-    for i in range(len(elements)):
+    for i in range(len(working_elements)):
         if i in skip_indices: continue
-        filtered_elements.append(elements[i])
         
-        for j in range(i + 1, len(elements)):
+        for j in range(i + 1, len(working_elements)):
             if j in skip_indices: continue
             
-            # If they are exactly the same class assignment...
-            if elements[i][1] == elements[j][1]:
-                iou = calculate_iou(elements[i][0], elements[j][0])
-                if iou > iou_threshold:
-                    # They are essentially stamping over each other wildly. Discard the duplicate.
-                    skip_indices.add(j)
+            box_i = working_elements[i][0]
+            box_j = working_elements[j][0]
+            class_i = working_elements[i][1].lower().replace("_", " ")
+            class_j = working_elements[j][1].lower().replace("_", " ")
+            
+            textual_classes = {"title", "plain text", "text"}
+            is_same_class = class_i == class_j
+            is_overlap_textual = (class_i in textual_classes) and (class_j in textual_classes)
+            
+            should_check = is_same_class or is_overlap_textual
+            
+            if should_check:
+                # 1. Check for Total Containment (Swallowing)
+                i_contains_j = is_contained(box_j, box_i)
+                j_contains_i = is_contained(box_i, box_j)
+                
+                if i_contains_j or j_contains_i:
+                    # Expand the survivor to the absolute Union of both boxes
+                    new_x1 = min(box_i[0], box_j[0])
+                    new_y1 = min(box_i[1], box_j[1])
+                    new_x2 = max(box_i[2], box_j[2])
+                    new_y2 = max(box_i[3], box_j[3])
+                    union_box = np.array([new_x1, new_y1, new_x2, new_y2])
                     
+                    if i_contains_j:
+                        working_elements[i][0] = union_box
+                        skip_indices.add(j)
+                    else:
+                        working_elements[j][0] = union_box
+                        skip_indices.add(i)
+                        break # outer element i is dead, stop evaluating against it
+                else:
+                    # 2. Check for Standard Heavy Intersection
+                    iou = calculate_iou(box_i, box_j)
+                    if iou > iou_threshold:
+                        skip_indices.add(j)
+                        
+    filtered_elements = [working_elements[i] for i in range(len(working_elements)) if i not in skip_indices]
     return filtered_elements
 
 def detect_ocr_language(sample_text):
@@ -180,19 +231,202 @@ def detect_ocr_language(sample_text):
     except:
         return 'eng'
 
+def extract_title_font_size(doc, page_num, fitz_rect):
+    """
+    Extracts the median font_size of the text enclosed in the rectangle.
+    Returns: Float font_size or None.
+    """
+    if not doc: return None
+    try:
+        page = doc[page_num]
+        words = page.get_text("dict", clip=fitz_rect)
+        sizes = []
+        for block in words.get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    sizes.append(span.get("size", 0))
+        if sizes:
+            sizes.sort()
+            return sizes[len(sizes)//2] # Return median to ignore weird stray characters
+    except Exception as e:
+        pass
+    return None
+
+def infer_heading_level(text, font_size, seen_fonts):
+    """
+    1) Try Numbering (e.g., '1.2.1 Details')
+    2) Try Font Size ranking (Largest = 1, Second = 2)
+    3) Fallback based on Word Count length
+    """
+    text_clean = text.strip()
+    
+    # 1. Numbering Check matches 1, 1.1, 1.2.1, etc.
+    m = re.match(r'^(\d+(\.\d+)*)', text_clean)
+    if m:
+        return m.group(1).count('.') + 1
+
+    # 2. Font Size Check
+    if font_size and seen_fonts:
+        # Create a ranking: largest font -> level 1, second largest -> level 2, etc.
+        sizes = sorted(list(seen_fonts), reverse=True)
+        # Assign numeric level based on rank (1-indexed)
+        font_map = {size: idx + 1 for idx, size in enumerate(sizes)}
+        
+        # Round font size slightly to collapse minute float discrepancies in extraction
+        rounded_size = round(font_size, 1)
+        # Find closest matching font size in map
+        closest_size = min(font_map.keys(), key=lambda k: abs(k - rounded_size))
+        
+        if abs(closest_size - rounded_size) < 1.0: # Only trust it if we have a near-exact match
+             return font_map[closest_size]
+
+    # 3. Fallback check
+    words = len(text_clean.split())
+    if words <= 4:
+        return 1
+    elif words <= 8:
+        return 2
+    else:
+        return 3
+
+def clean_camelot_html(html_string):
+    """Clean up formatting/padding artifacts dynamically via BeautifulSoup"""
+    try:
+        soup = BeautifulSoup(html_string, "html.parser")
+        
+        # Target all rows in the table (bypassing thead/tbody strictness)
+        rows = soup.find_all("tr")
+        if not rows:
+            return html_string
+            
+        # 1. Top padding removal
+        while rows and all(not cell.get_text(strip=True) for cell in rows[0].find_all(["td", "th"])):
+            rows[0].decompose()
+            rows.pop(0)
+            
+        # 2. Bottom padding removal
+        while rows and all(not cell.get_text(strip=True) for cell in rows[-1].find_all(["td", "th"])):
+            rows[-1].decompose()
+            rows.pop(-1)
+            
+        # 3. Empty columns removal
+        if rows:
+            # Find the max cols to avoid zip truncation if rows are uneven
+            max_cols = max(len(tr.find_all(["td", "th"])) for tr in rows)
+            
+            # Identify columns that are empty across ALL surviving rows
+            empty_cols_indices = []
+            for col_idx in range(max_cols):
+                is_empty = True
+                for tr in rows:
+                    cells = tr.find_all(["td", "th"])
+                    if col_idx < len(cells):
+                        if cells[col_idx].get_text(strip=True):
+                            is_empty = False
+                            break
+                if is_empty:
+                    empty_cols_indices.append(col_idx)
+                    
+            # Remove from right-to-left to avoid index shifting breaking destruction
+            for tr in rows:
+                cells = tr.find_all(["td", "th"])
+                for idx in reversed(empty_cols_indices):
+                    if idx < len(cells):
+                        cells[idx].decompose()
+                        
+        return str(soup)
+    except Exception as parse_e:
+        print(f"  [WARN] BeautifulSoup cleaning failed, falling back to raw HTML. ({parse_e})")
+        return html_string
+
+def extract_table_camelot(input_path, page_num_str, x_min, y_min, x_max, y_max, pdf_h, pdf_w):
+    """
+    Extracts a table using Camelot logic mapped from YOLO coordinates.
+    Returns: A clean Markdown string of the table, or None if extraction failed.
+    """
+    try:
+        # Map 300 DPI YOLO coordinates to 72 DPI PDF coordinates with PADDING
+        scale = 72 / 300
+        padding = 3 # Give Camelot a slightly larger viewport to "see" the table borders
+        
+        x1 = max(0, (x_min * scale) - padding)
+        y1_orig = pdf_h - (y_min * scale)
+        y1 = min(pdf_h, y1_orig + padding) # Top-Left Y (PDF origin is bottom-left, so + pushes it "up")
+        
+        x2 = min(pdf_w, (x_max * scale) + padding)
+        y2_orig = pdf_h - (y_max * scale)
+        y2 = max(0, y2_orig - padding) # Bottom-Right Y (- pushes it "down")
+        
+        # Camelot expects string format "x1,y1,x2,y2"
+        table_area = f"{x1},{y1},{x2},{y2}"
+        
+        print(f"  [GEOMETRY] Mapping table crop {table_area} to Camelot Lattice engine...")
+        tables = camelot.read_pdf(
+            input_path, 
+            pages=page_num_str, 
+            flavor='lattice',
+            table_areas=[table_area]
+        )
+        
+        if len(tables) > 0:
+            # When given a region containing multiple tables, Camelot might return all of them.
+            # Find the table whose center is closest to our YOLO bounding box center
+            target_table = tables[0]
+            if len(tables) > 1:
+                yolo_center_x = (x1 + x2) / 2
+                yolo_center_y = (y1 + y2) / 2
+                min_dist = float('inf')
+                for t in tables:
+                    tx1, ty1, tx2, ty2 = t._bbox
+                    t_center_x = (tx1 + tx2) / 2
+                    t_center_y = (ty1 + ty2) / 2
+                    dist = ((t_center_x - yolo_center_x)**2 + (t_center_y - yolo_center_y)**2)**0.5
+                    if dist < min_dist:
+                        min_dist = dist
+                        target_table = t
+            
+            import tempfile
+            import os
+            temp_html = tempfile.mktemp(suffix='.html')
+            # Bypass Camelot's default HTML export which writes pandas DataFrame indices to the table headers
+            target_table.df.to_html(temp_html, index=False, header=False)
+            
+            with open(temp_html, 'r', encoding='utf-8') as html_file:
+                html_string = html_file.read()
+            os.remove(temp_html)
+            
+            clean_html = clean_camelot_html(html_string)
+            md_table = html_to_md_convert(clean_html)
+            
+            # Explicitly delete table objects to release file locks on Windows
+            del tables
+            
+            if md_table and len(md_table.strip()) > 5:
+                return md_table
+                
+    except Exception as e:
+        print(f"  [WARN] Camelot extraction failed: {e}")
+    finally:
+        # Force Garbage Collection to purge dangling pypdf/ghostscript handles inside Camelot
+        import gc
+        gc.collect()
+        
+    return None
+
 def sort_elements_multicolumn(elements, page_width):
     if not elements:
         return []
         
-    # 1. Identify wide elements (>60% page width) to serve as column breakers
+    # Pre-sort everything top-to-bottom so our iteration through the page is strictly chronological
+    elements.sort(key=lambda x: x[0][1])
+        
+    # 1. Identify wide elements (>60% page width) to serve as column breakers (e.g. Banners/Large Titles)
     wide_elements_idx = []
     for idx, (xyxy, name) in enumerate(elements):
         w = xyxy[2] - xyxy[0]
         if w > 0.6 * page_width:
             wide_elements_idx.append(idx)
             
-    wide_elements_idx.sort(key=lambda i: elements[i][0][1])
-
     # 2. Slice page horizontally by the breakers
     bands = []
     current_y = 0
@@ -213,42 +447,60 @@ def sort_elements_multicolumn(elements, page_width):
     sorted_output = []
     column_separators = []
     
-    band_queue_idx = 0
-    wide_queue_idx = 0
-    
-    # 3. Process the bands using KMeans horizontally
-    while band_queue_idx < len(bands):
-        b_top, b_bottom = bands[band_queue_idx]
+    # 3. Process the bands using KMeans horizontally, injecting the wide banners between them!
+    for b_idx in range(len(bands)):
+        b_top, b_bottom = bands[b_idx]
         band_elements = []
-        band_original_indices = []
         
-        for idx, (xyxy, _) in enumerate(elements):
+        for idx in range(len(elements)):
             if idx in placed_indices: continue
-            y_center = (xyxy[1] + xyxy[3]) / 2
+            xyxy = elements[idx][0]
+            # Use the TOP of the element to determine which band it belongs in
+            y_top = xyxy[1]
+            
             # Handle float('inf') math gracefully
             bottom_val = b_bottom if b_bottom != float('inf') else float('inf')
             
-            if b_top <= y_center < bottom_val:
+            if b_top <= y_top < bottom_val:
                 band_elements.append(elements[idx])
-                band_original_indices.append(idx)
                 placed_indices.add(idx)
                 
         if band_elements:
-            x_centers = np.array([get_center(e[0])[0] for e in band_elements]).reshape(-1, 1)
-            n_cols = 2 if len(band_elements) >= 2 else 1
-            print(f"  [KMEANS] Scanning Band {band_queue_idx + 1} ({len(band_elements)} elements) -> Grouping into {n_cols} columns.")
+            # Group by Left-most text alignment rather than center, since ragged-right documents warp center calculations
+            x_lefts = np.array([e[0][0] for e in band_elements]).reshape(-1, 1)
+            
+            n_cols = 1
+            if len(band_elements) >= 2:
+                # Perform an Inertia-based (Variance Drop) evaluation to choose 1 vs 2 columns dynamically
+                km1 = KMeans(n_clusters=1, random_state=0, n_init='auto').fit(x_lefts)
+                
+                if km1.inertia_ > 0:
+                    km2 = KMeans(n_clusters=2, random_state=0, n_init='auto').fit(x_lefts)
+                    
+                    # If grouping into 2 columns destroys >60% of the variance (meaning the layout is distinctly bi-modal)...
+                    if km2.inertia_ < (km1.inertia_ * 0.4):
+                        # Ensure the columns are ACTUALLY physically separated (e.g. > 10% of page width)
+                        # This prevents severe paragraph indents from creating microscopic fake columns!
+                        centers = sorted(km2.cluster_centers_.flatten())
+                        if (centers[1] - centers[0]) > (0.1 * page_width):
+                            n_cols = 2
+                        
+            print(f"  [KMEANS] Scanning Band {b_idx + 1} ({len(band_elements)} elements) -> Grouping into {n_cols} columns (Inertia Evaluated).")
             
             try:
-                # Use cluster center sorting to determine left-vs-right columns dynamically
-                kmeans = KMeans(n_clusters=n_cols, random_state=0, n_init='auto').fit(x_centers)
+                # Use left-point sorting to determine columns dynamically
+                kmeans = KMeans(n_clusters=n_cols, random_state=0, n_init='auto').fit(x_lefts)
                 col_assignment = kmeans.labels_
                 col_order = np.argsort(kmeans.cluster_centers_.flatten())
                 
                 col_groups = {i: [] for i in range(n_cols)}
                 for i, col_idx in enumerate(col_assignment):
+                    # Append elements to their assigned KMeans column
                     col_groups[col_idx].append(band_elements[i])
                     
+                # Sort each column structurally block by block from top-to-bottom
                 for col_idx in col_groups:
+                    # Sort primarily by Top Y-coordinate (y_min) to ensure true vertical reading order
                     col_groups[col_idx].sort(key=lambda x: x[0][1]) 
                     
                 for col_idx in col_order:
@@ -262,16 +514,13 @@ def sort_elements_multicolumn(elements, page_width):
                     
             except Exception as e:
                 print(f"  [WARN] KMeans failed on this band ({e}). Defaulting to standard Y sort.")
-                band_elements.sort(key=lambda x: (x[0][1] // 20, x[0][0]))
+                band_elements.sort(key=lambda x: x[0][1])
                 sorted_output.extend(band_elements)
 
-        band_queue_idx += 1
-        
-        # Append the wide element separator back into the flow
-        if wide_queue_idx < len(wide_bounds):
-            wide_idx = wide_bounds[wide_queue_idx][0]
+        # Append the specific wide element that borders the BOTTOM of this band
+        if b_idx < len(wide_bounds):
+            wide_idx = wide_bounds[b_idx][0]
             sorted_output.append(elements[wide_idx])
-            wide_queue_idx += 1
             
     # Sweep stragglers strictly by reading order
     stragglers = [elements[i] for i in range(len(elements)) if i not in placed_indices]
@@ -314,6 +563,12 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
 
     detected_lang = None # Will figure this out on the first chunk of text
     annotated_pages = [] # Will store visual debugging representations
+    caption_padding = 20
+    
+    # Master collection of observed Title Font Sizes (so we can determine what H1/H2 sizes are)
+    seen_title_font_sizes = set()
+    # Track titles to defer heading level resolution until we've parsed the full document
+    deferred_titles = []
 
     for i in range(total_pages):
         
@@ -515,6 +770,13 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
                             pdf_text = doc[i].get_textbox(fitz_rect).strip()
                             if pdf_text:
                                 extracted_text = clean_extracted_text(pdf_text)
+                                
+                            # Always attempt font extraction for titles to build our H1/H2 map!
+                            if cat_norm == "title":
+                                fs = extract_title_font_size(doc, i, fitz_rect)
+                                if fs is not None:
+                                    seen_title_font_sizes.add(round(fs, 1))
+                                    
                         except Exception as e:
                             pass
                     
@@ -544,7 +806,22 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
                         print(f"  [EXTRACT] ({extraction_method}): {extracted_text[:40].replace(chr(10), ' ')}...")
                         
                         if cat_norm == "title":
-                            md_content.append(f"## {extracted_text}\n")
+                            # Pull active font size from bounding rect if possible to assist heuristic mapping
+                            active_font_size = None
+                            if is_pdf and doc:
+                                scale = 72 / 300
+                                fitz_rect = fitz.Rect(x_min * scale, y_min * scale, x_max * scale, y_max * scale)
+                                active_font_size = extract_title_font_size(doc, i, fitz_rect)
+                                
+                            title_id = len(deferred_titles)
+                            deferred_titles.append({
+                                "id": title_id,
+                                "text": extracted_text,
+                                "font_size": active_font_size
+                            })
+                            
+                            # Inject placeholder
+                            md_content.append(f"{{{{TITLE_PLACEHOLDER_{title_id}}}}} {extracted_text}\n")
                         else:
                             md_content.append(f"{extracted_text}\n")
                     else:
@@ -569,54 +846,17 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
                     # Camelot Table Extraction Override
                     table_extracted = False
                     if "table" in cat_norm and is_pdf and doc:
-                        try:
-                            # Map 300 DPI YOLO coordinates to 72 DPI PDF coordinates
-                            scale = 72 / 300
-                            pdf_h = doc[i].rect.height
-                            
-                            x1 = max(0, x_min * scale)
-                            y1 = max(0, pdf_h - (y_min * scale)) # Top-Left Y (PDF origin is bottom-left)
-                            x2 = max(0, x_max * scale)
-                            y2 = max(0, pdf_h - (y_max * scale)) # Bottom-Right Y
-
-                            table_area = f"{x1},{y1},{x2},{y2}"
-                            
-                            print(f"  [GEOMETRY] Mapping table crop {table_area} to Camelot Lattice engine...")
-                            tables = camelot.read_pdf(
-                                input_path, 
-                                pages=str(i + 1), 
-                                flavor='hybrid', 
-                                table_areas=[table_area]
-                            )
-                            
-                            if len(tables) > 0:
-                                import tempfile
-                                temp_html = tempfile.mktemp(suffix='.html')
-                                tables[0].to_html(temp_html) # Writes exactly the HTML layout we need
-                                
-                                with open(temp_html, 'r', encoding='utf-8') as html_file:
-                                    html_string = html_file.read()
-                                os.remove(temp_html)
-                                
-                                md_table = html_to_md_convert(html_string)
-                                if md_table and len(md_table.strip()) > 5:
-                                    print(f"  [EXTRACT] (Camelot Table Parse): Successfully converted HTML table to Native Markdown.")
-                                    # Append the parsed Markdown table
-                                    md_content.append(f"{md_table}\n")
-                                    if paired_caption_text:
-                                        md_content.append(f"*{paired_caption_text}*\n")
-                                        
-                                    table_extracted = True
-                                    
-                                # Explicitly delete table objects to release file locks on Windows
-                                del tables
-                                
-                        except Exception as e:
-                            print(f"  [WARN] Camelot extraction failed: {e}")
-                        finally:
-                            # Force Garbage Collection to purge dangling pypdf/ghostscript handles inside Camelot
-                            import gc
-                            gc.collect()
+                        pdf_h = doc[i].rect.height
+                        pdf_w = doc[i].rect.width
+                        md_table = extract_table_camelot(input_path, str(i + 1), x_min, y_min, x_max, y_max, pdf_h, pdf_w)
+                        
+                        if md_table:
+                            print(f"  [EXTRACT] (Camelot Table Parse): Successfully converted HTML table to Native Markdown.")
+                            # Append the parsed Markdown table
+                            md_content.append(f"{md_table}\n")
+                            if paired_caption_text:
+                                md_content.append(f"*{paired_caption_text}*\n")
+                            table_extracted = True
                             
                     # Fallback to pure Image logic if Camelot failed or it's a Figure/Formula
                     if not table_extracted:
@@ -663,6 +903,34 @@ def process_pdf_to_markdown(input_path, output_md_path, image_output_dir, model,
         import gc
         gc.collect()
         
+    # Phase 3: Deferred Two-Pass Title Hierarchy Resolution
+    if deferred_titles:
+        if args.enable_heading_hierarchy:
+            print(f"  [ANALYSIS] Re-evaluating {len(deferred_titles)} titles against global document font scales...")
+            with open(output_md_path, "r", encoding="utf-8") as f:
+                full_md_text = f.read()
+                
+            for t in deferred_titles:
+                heading_level = infer_heading_level(t["text"], t["font_size"], seen_title_font_sizes)
+                heading_level = min(6, heading_level) # Standardize markdown max-depth ceiling
+                hashes = "#" * heading_level
+                
+                # Find and replace the specific placeholder for this title in the markdown stream
+                placeholder = f"{{{{TITLE_PLACEHOLDER_{t['id']}}}}}"
+                full_md_text = full_md_text.replace(placeholder, hashes)
+                
+            with open(output_md_path, "w", encoding="utf-8") as f:
+                f.write(full_md_text)
+        else:
+            print(f"  [ANALYSIS] Heuristic Heading algorithm disabled by config. Defaulting all titles to H2...")
+            with open(output_md_path, "r", encoding="utf-8") as f:
+                full_md_text = f.read()
+            for t in deferred_titles:
+                placeholder = f"{{{{TITLE_PLACEHOLDER_{t['id']}}}}}"
+                full_md_text = full_md_text.replace(placeholder, "##")
+            with open(output_md_path, "w", encoding="utf-8") as f:
+                f.write(full_md_text)
+            
     # Compile the Visual Layout Debug PDF
     if args.draw_pdf and annotated_pages:
         vis_pdf_path = output_md_path.replace('.md', '_visual_layout.pdf')
@@ -676,7 +944,8 @@ if __name__ == "__main__":
     parser.add_argument('target_path', nargs='?', default="pdf_dataset", help='System path to a PDF, Image, or Directory. (Default: "pdf_dataset")')
     parser.add_argument('--no-kmeans', dest='enable_kmeans', action='store_false', default=True, help='Disable the multi-column KMeans algorithm entirely (falls back to vertical sweep). (Default: KMeans Enabled)')
     parser.add_argument('--no-pdf', dest='draw_pdf', action='store_false', default=True, help='Disable the generation of the companion visual layout debug PDF. (Default: PDF Generation Enabled)')
-    parser.add_argument('--iou-filter', type=float, default=0.85, help='Threshold [0.0 - 1.0]. Deletes perfectly overlapping bounding boxes of the same type (e.g., 0.85 = drops duplicates that share 85 percent area. Set to 0 to disable mathematically). (Default: 0.85)')
+    parser.add_argument('--iou-filter', type=float, default=0.85, help='Threshold [0.0 - 1.0]. Deletes perfectly overlapping bounding boxes of the same type. (Default: 0.85)')
+    parser.add_argument('--enable-heading-hierarchy', dest='enable_heading_hierarchy', action='store_true', default=False, help='Toggles the experimental dynamic H1/H2 font-scaling heuristic algorithm. (Default: Disabled)')
     
     args = parser.parse_args()
     target_path = args.target_path
